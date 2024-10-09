@@ -8,29 +8,30 @@ class TurtleMover {
 public:
     TurtleMover() : tolerance_(0.1) {}
 
-    geometry_msgs::msg::Twist calculate_movement(const turtlesim::msg::Pose& current_pose, double target_x, double target_y, double speed) {
-        geometry_msgs::msg::Twist move_cmd;
+    bool calculate_movement(geometry_msgs::msg::Twist& twist, const turtlesim::msg::Pose& current_pose, double target_x, double target_y, double speed) {
         double distance = get_distance(current_pose, target_x, target_y);
-
         if (distance < tolerance_) {
-            move_cmd.linear.x = 0;
-            move_cmd.angular.z = 0;
-        } else {
-            move_cmd.linear.x = speed;
-            move_cmd.angular.z = get_angle_diff(current_pose, target_x, target_y) * 100;
+            twist.linear.x = 0;
+            twist.angular.z = 0;
+            return false; // 目标已到达
         }
-        return move_cmd;
+        twist.linear.x = speed;
+        twist.angular.z = get_angle_diff(current_pose, target_x, target_y) * 100;
+        return true; // 尚未到达目标
     }
 
 private:
     double tolerance_;
+    
     double get_angle_diff(const turtlesim::msg::Pose& current_pose, double target_x, double target_y) const {
         double angle_to_target = std::atan2(target_y - current_pose.y, target_x - current_pose.x);
         return normalize_angle(angle_to_target - current_pose.theta);
     }
+
     double get_distance(const turtlesim::msg::Pose& current_pose, double target_x, double target_y) const {
         return std::hypot(current_pose.x - target_x, current_pose.y - target_y);
     }
+
     double normalize_angle(double angle) const {
         while (angle > M_PI) angle -= 2 * M_PI;
         while (angle < -M_PI) angle += 2 * M_PI;
@@ -45,12 +46,17 @@ public:
         : RosTopicPubNode<geometry_msgs::msg::Twist>(name, config, params)
     {
         std::string topic_name;
-        double target_x, target_y, speed;
-
         if (getInput<std::string>("topic_name", topic_name) &&
-            getInput<double>("target_x", target_x) &&
-            getInput<double>("target_y", target_y) &&
-            getInput<double>("speed", speed)) {
+            getInput<double>("target_x", target_x_) &&
+            getInput<double>("target_y", target_y_) &&
+            getInput<double>("speed", speed_)) {
+
+            // Log input parameters
+            RCLCPP_INFO(node_->get_logger(), "Initializing MoveTurtleForward node");
+            RCLCPP_INFO(node_->get_logger(), "Topic Name: %s", topic_name.c_str());
+            RCLCPP_INFO(node_->get_logger(), "Target Position: (%f, %f)", target_x_, target_y_);
+            RCLCPP_INFO(node_->get_logger(), "Speed: %f", speed_);
+
             cmd_vel_publisher_ = node_->create_publisher<geometry_msgs::msg::Twist>(topic_name + "/cmd_vel", 10);
             pose_subscription_ = node_->create_subscription<turtlesim::msg::Pose>(
                 topic_name + "/pose",
@@ -59,13 +65,11 @@ public:
                     this->current_pose_ = *msg;
                 }
             );
-            target_x_ = target_x;
-            target_y_ = target_y;
-            speed_ = speed;
+
             turtle_mover_ = std::make_shared<TurtleMover>();
         } else {
             RCLCPP_ERROR(node_->get_logger(), "Failed to get parameters from input port.");
-            exit(1);
+            throw std::runtime_error("Parameter retrieval failed");
         }
     }
 
@@ -78,9 +82,8 @@ public:
         };
     }
 
-    bool setMessage(geometry_msgs::msg::Twist& msg) {
-        msg = turtle_mover_->calculate_movement(current_pose_, target_x_, target_y_, speed_);
-        return true; // 返回成功
+    bool setMessage(geometry_msgs::msg::Twist& twist) {
+        return turtle_mover_->calculate_movement(twist, current_pose_, target_x_, target_y_, speed_);
     }
 
     BT::NodeStatus onTick() {
@@ -89,7 +92,7 @@ public:
             cmd_vel_publisher_->publish(msg);
             return BT::NodeStatus::RUNNING;
         }
-        return BT::NodeStatus::FAILURE;
+        return BT::NodeStatus::SUCCESS; // 达到目标
     }
 
 private:

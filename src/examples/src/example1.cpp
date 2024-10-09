@@ -3,70 +3,48 @@
 #include <behaviortree_ros2/bt_topic_pub_node.hpp>
 #include <turtlesim/msg/pose.hpp>
 #include <cmath>
+#include <chrono>
 
-class TurtleMover {
+using namespace std::chrono_literals;
+
+class TurtlePoseSubscriber {
 public:
-    TurtleMover() : tolerance_(0.1) {}
+    TurtlePoseSubscriber(rclcpp::Node::SharedPtr node) {
+        pose_subscription_ = node->create_subscription<turtlesim::msg::Pose>(
+            "turtle1/pose",
+            10,
+            [this](const turtlesim::msg::Pose::SharedPtr msg) {
+                current_pose_ = *msg;
+            }
+        );
+    }
 
-    bool calculate_movement(geometry_msgs::msg::Twist& twist, const turtlesim::msg::Pose& current_pose, double target_x, double target_y, double speed) {
-        double distance = get_distance(current_pose, target_x, target_y);
-        if (distance < tolerance_) {
-            twist.linear.x = 0;
-            twist.angular.z = 0;
-            return false; // 目标已到达
-        }
-        twist.linear.x = speed;
-        twist.angular.z = get_angle_diff(current_pose, target_x, target_y) * 100;
-        return true; // 尚未到达目标
+    const turtlesim::msg::Pose& get_current_pose() const {
+        return current_pose_;
     }
 
 private:
-    double tolerance_;
-    
-    double get_angle_diff(const turtlesim::msg::Pose& current_pose, double target_x, double target_y) const {
-        double angle_to_target = std::atan2(target_y - current_pose.y, target_x - current_pose.x);
-        return normalize_angle(angle_to_target - current_pose.theta);
-    }
-
-    double get_distance(const turtlesim::msg::Pose& current_pose, double target_x, double target_y) const {
-        return std::hypot(current_pose.x - target_x, current_pose.y - target_y);
-    }
-
-    double normalize_angle(double angle) const {
-        while (angle > M_PI) angle -= 2 * M_PI;
-        while (angle < -M_PI) angle += 2 * M_PI;
-        return angle;
-    }
+    turtlesim::msg::Pose current_pose_;
+    rclcpp::Subscription<turtlesim::msg::Pose>::SharedPtr pose_subscription_;
 };
 
-// 行为树自定义节点
-class MoveTurtleForward : public BT::RosTopicPubNode<geometry_msgs::msg::Twist> {
+class TurtleTwistPublisher : public BT::RosTopicPubNode<geometry_msgs::msg::Twist> {
 public:
-    MoveTurtleForward(const std::string& name, const BT::NodeConfiguration& config, const BT::RosNodeParams& params)
-        : RosTopicPubNode<geometry_msgs::msg::Twist>(name, config, params)
+    TurtleTwistPublisher(const std::string& name, const BT::NodeConfiguration& config, const BT::RosNodeParams& params)
+        : RosTopicPubNode<geometry_msgs::msg::Twist>(name, config, params), tolerance_(0.01), pose_subscriber_(TurtlePoseSubscriber(node_))
     {
         std::string topic_name;
-        if (getInput<std::string>("topic_name", topic_name) &&
+        if (
+            getInput<std::string>("topic_name", topic_name) &&
             getInput<double>("target_x", target_x_) &&
             getInput<double>("target_y", target_y_) &&
-            getInput<double>("speed", speed_)) {
-
+            getInput<double>("speed", speed_)
+        ) {
             // Log input parameters
             RCLCPP_INFO(node_->get_logger(), "Initializing MoveTurtleForward node");
             RCLCPP_INFO(node_->get_logger(), "Topic Name: %s", topic_name.c_str());
             RCLCPP_INFO(node_->get_logger(), "Target Position: (%f, %f)", target_x_, target_y_);
             RCLCPP_INFO(node_->get_logger(), "Speed: %f", speed_);
-
-            cmd_vel_publisher_ = node_->create_publisher<geometry_msgs::msg::Twist>(topic_name + "/cmd_vel", 10);
-            pose_subscription_ = node_->create_subscription<turtlesim::msg::Pose>(
-                topic_name + "/pose",
-                10,
-                [this](const turtlesim::msg::Pose::SharedPtr msg){
-                    this->current_pose_ = *msg;
-                }
-            );
-
-            turtle_mover_ = std::make_shared<TurtleMover>();
         } else {
             RCLCPP_ERROR(node_->get_logger(), "Failed to get parameters from input port.");
             throw std::runtime_error("Parameter retrieval failed");
@@ -82,32 +60,59 @@ public:
         };
     }
 
-    bool setMessage(geometry_msgs::msg::Twist& twist) {
-        return turtle_mover_->calculate_movement(twist, current_pose_, target_x_, target_y_, speed_);
+    bool setMessage(geometry_msgs::msg::Twist& msg) {
+        if(calculate_movement(msg)) {
+            RCLCPP_DEBUG(node_->get_logger(), "Publishing cmd_vel: linear.x = %f, angular.z = %f", msg.linear.x, msg.angular.z);
+            return true;
+        }
+        return false;
     }
 
-    BT::NodeStatus onTick() {
-        geometry_msgs::msg::Twist msg;
-        if (setMessage(msg)) {
-            cmd_vel_publisher_->publish(msg);
-            return BT::NodeStatus::RUNNING;
+    bool calculate_movement(geometry_msgs::msg::Twist& twist) {
+        double distance = get_distance();
+        if (distance < tolerance_) {
+            twist.linear.x = 0;
+            twist.angular.z = 0;
+            return true;
         }
-        return BT::NodeStatus::SUCCESS; // 达到目标
+        double angular = get_angle_diff();
+        if (std::abs(angular) > tolerance_) {
+            twist.linear.x = 0;
+            twist.angular.z = angular;
+        } else {
+            twist.linear.x = speed_;
+            twist.angular.z = 0;
+        }
+        return true;
     }
 
 private:
+    double get_angle_diff() const {
+        double angle_to_target = std::atan2(target_y_ - pose_subscriber_.get_current_pose().y, target_x_ - pose_subscriber_.get_current_pose().x);
+        return normalize_angle(angle_to_target - pose_subscriber_.get_current_pose().theta);
+    }
+
+    double get_distance() const {
+        return std::hypot(pose_subscriber_.get_current_pose().x - target_x_, pose_subscriber_.get_current_pose().y - target_y_);
+    }
+
+    double normalize_angle(double angle) const {
+        while (angle > M_PI) angle -= 2 * M_PI;
+        while (angle < -M_PI) angle += 2 * M_PI;
+        return angle;
+    }
+
+    double tolerance_;
     double target_x_, target_y_, speed_;
-    turtlesim::msg::Pose current_pose_;
-    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_publisher_;
-    rclcpp::Subscription<turtlesim::msg::Pose>::SharedPtr pose_subscription_;
-    std::shared_ptr<TurtleMover> turtle_mover_;
+    TurtlePoseSubscriber pose_subscriber_;
 };
 
+// 改名字在这里改 topic_name 后面的 turtle1 再重新编译即可，topic_name 是个变量，不要把所有 topic_name 替换掉。
 static const char* xml_text = R"(
   <root BTCPP_format="4">
     <BehaviorTree>
       <Sequence>
-        <MoveTurtleForward topic_name="turtle1" target_x="1.0" target_y="1.0" speed="1.0"/>
+        <TurtleTwistPublisher topic_name="turtle1/cmd_vel" target_x="1.0" target_y="1.0" speed="1.0"/>
       </Sequence>
     </BehaviorTree>
   </root>
@@ -121,14 +126,13 @@ int main(int argc, char** argv) {
     BT::BehaviorTreeFactory factory;
     BT::RosNodeParams params;
     params.nh = nh; // 将节点传递给参数
-
-    factory.registerNodeType<MoveTurtleForward>("MoveTurtleForward", params);
+    factory.registerNodeType<TurtleTwistPublisher>("TurtleTwistPublisher", params);
     auto tree = factory.createTreeFromText(xml_text);
 
     // 主要执行循环
     while (rclcpp::ok()) {
-        tree.tickWhileRunning(); // 每次迭代调用 tick
-        rclcpp::spin_some(nh); // 处理任何其他的 ROS 事件
+        rclcpp::spin_some(nh);
+        tree.tickOnce();
     }
 
     rclcpp::shutdown();

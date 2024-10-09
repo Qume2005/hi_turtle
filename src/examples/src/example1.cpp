@@ -103,6 +103,7 @@ private:
     std::shared_ptr<TurtleMover> turtle_mover_;
 };
 
+// 改名字在这里改 topic_name 后面的 turtle1 再重新编译即可，topic_name 是个变量，不要把所有 topic_name 替换掉。
 static const char* xml_text = R"(
   <root BTCPP_format="4">
     <BehaviorTree>

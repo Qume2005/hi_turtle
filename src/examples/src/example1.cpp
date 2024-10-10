@@ -4,6 +4,9 @@
 #include <behaviortree_ros2/bt_topic_sub_node.hpp>
 #include <turtlesim/msg/pose.hpp>
 
+#define DISTANCE_TOLERANCE 0.1
+#define ANGULAR_TOLERANCE 0.01
+
 using namespace BT;
 
 class TurtlePoseSubscriber : public RosTopicSubNode<turtlesim::msg::Pose>
@@ -13,7 +16,7 @@ public:
     :   RosTopicSubNode<turtlesim::msg::Pose>(name, config, params)
     {
         auto node_ptr = node_.lock();
-        if (!getInput<std::string>("topic_name", topic_name_) || !getInput<std::string>("turtle_name", turtle_name_)) {
+        if (!getInput<std::string>("topic_name", topic_name_)) {
             if (node_ptr) {
                 RCLCPP_ERROR(node_ptr->get_logger(), "TurtlePoseSubscriber failed to get parameters from input port.");
             }
@@ -25,8 +28,7 @@ public:
     static PortsList providedPorts()
     {
         return {
-            BT::InputPort<std::string>("topic_name"),
-            BT::InputPort<std::string>("turtle_name")
+            BT::InputPort<std::string>("topic_name")
         };
     }
 
@@ -36,71 +38,64 @@ public:
         {
             return NodeStatus::FAILURE;
         }
-        blackboard_->set<turtlesim::msg::Pose>(turtle_name_, *msg);
+        blackboard_->set<turtlesim::msg::Pose>("current_pose", *msg);
         return NodeStatus::SUCCESS;
 
     }
 private:
     BT::Blackboard::Ptr blackboard_;
     std::string topic_name_;
-    std::string turtle_name_;
 };
 
 class TurtleTwistPublisher : public BT::RosTopicPubNode<geometry_msgs::msg::Twist> {
 public:
     TurtleTwistPublisher(const std::string& name, const BT::NodeConfiguration& config, const BT::RosNodeParams& params)
-        : RosTopicPubNode<geometry_msgs::msg::Twist>(name, config, params), tolerance_(0.01)
+        : RosTopicPubNode<geometry_msgs::msg::Twist>(name, config, params)
     {
-        if (
-            !getInput<std::string>("topic_name", topic_name_)
-            || !getInput<std::string>("turtle_name", turtle_name_)
-            || !getInput<double>("target_x", target_x_)
-            || !getInput<double>("target_y", target_y_)
-            || !getInput<double>("speed", speed_)
+        if (!getInput<std::string>("topic_name", topic_name_) ||
+            !getInput<double>("speed", speed_)
         ) {
             RCLCPP_ERROR(node_->get_logger(), "TurtleTwistPublisher failed to get parameters from input port.");
             throw std::runtime_error("Parameter retrieval failed");
         }
-        RCLCPP_INFO(node_->get_logger(), "Initializing MoveTurtleForward node");
+        blackboard_ = config.blackboard;
+        if (!blackboard_->get<double>("target_x", target_x_) ||
+            !blackboard_->get<double>("target_y", target_y_)
+        ) {
+            RCLCPP_ERROR(node_->get_logger(), "Pose not found in blackboard for target pose.");
+            throw std::runtime_error("Blackboard retrieval failed");
+        }
         RCLCPP_INFO(node_->get_logger(), "Topic Name: %s", topic_name_.c_str());
         RCLCPP_INFO(node_->get_logger(), "Target Position: (%f, %f)", target_x_, target_y_);
         RCLCPP_INFO(node_->get_logger(), "Speed: %f", speed_);
-        blackboard_ = config.blackboard;
     }
 
     static BT::PortsList providedPorts() {
         return {
             BT::InputPort<std::string>("topic_name"),
-            BT::InputPort<std::string>("turtle_name"),
-            BT::InputPort<double>("target_x"),
-            BT::InputPort<double>("target_y"),
             BT::InputPort<double>("speed")
         };
     }
 
-    bool setMessage(geometry_msgs::msg::Twist& msg) {
-        if (!blackboard_->get<turtlesim::msg::Pose>(turtle_name_, current_pose_)) {
-            RCLCPP_ERROR(node_->get_logger(), "Pose not found in blackboard for %s.", turtle_name_.c_str());
+    bool setMessage(geometry_msgs::msg::Twist& msg) override {
+        if (!blackboard_->get<turtlesim::msg::Pose>("current_pose", current_pose_)) {
+            RCLCPP_ERROR(node_->get_logger(), "Pose not found in blackboard for current pose.");
             return false; // 数据不存在，返回失败
         }
-        if(calculate_movement(msg)) {
-            RCLCPP_DEBUG(node_->get_logger(), "Publishing cmd_vel: linear.x = %f, angular.z = %f", msg.linear.x, msg.angular.z);
-            return true;
-        }
-        return false;
+        return calculate_movement(msg);
     }
 
     bool calculate_movement(geometry_msgs::msg::Twist& twist) {
         double distance = get_distance();
-        if (distance < tolerance_) {
+        if (distance < DISTANCE_TOLERANCE) {
             twist.linear.x = 0;
             twist.angular.z = 0;
             return true;
         }
         double angular = get_angle_diff();
-        if (std::abs(angular) > tolerance_) {
+        if (std::abs(angular) > ANGULAR_TOLERANCE) {
             twist.linear.x = 0;
-            twist.angular.z = angular;
+            twist.angular.z = angular * 10;
         } else {
             twist.linear.x = speed_;
             twist.angular.z = 0;
@@ -124,44 +119,94 @@ private:
         return angle;
     }
 
-    double tolerance_;
     double target_x_, target_y_, speed_;
     std::string topic_name_;
-    std::string turtle_name_;
     BT::Blackboard::Ptr blackboard_;
     turtlesim::msg::Pose current_pose_;
 };
 
-// 行为树的 XML 定义
-static const char* xml_text = R"(
-  <root BTCPP_format="4">
-    <BehaviorTree>
-      <Sequence>
-        <TurtlePoseSubscriber topic_name="turtle1/pose" turtle_name="turtle1" />
-        <TurtleTwistPublisher topic_name="turtle1/cmd_vel" turtle_name="turtle1" target_x="5.0" target_y="5.0" speed="2.0" />
-      </Sequence>
-    </BehaviorTree>
-  </root>
-)";
+class StopOnceAchieved : public BT::DecoratorNode
+{
+public:
+    StopOnceAchieved(const std::string& name, const BT::NodeConfiguration& config, const BT::RosNodeParams& params)
+        : BT::DecoratorNode(name, config)
+    {
+        current_pose_.set__x(MAXFLOAT / 2);
+        current_pose_.set__y(MAXFLOAT / 2);
+        blackboard_ = config.blackboard;
+        auto node = params.nh.lock();
+        if (!getInput<double>("target_x", target_x_) ||
+            !getInput<double>("target_y", target_y_)
+        ) {
+            RCLCPP_ERROR(node->get_logger(), "TurtleTwistPublisher failed to get parameters from input port.");
+            throw std::runtime_error("Parameter retrieval failed");
+        }
+        RCLCPP_INFO(node->get_logger(), "Target Position: (%f, %f)", target_x_, target_y_);
+        blackboard_ = config.blackboard;
+        blackboard_->set("target_x", target_x_);
+        blackboard_->set("target_y", target_y_);
+    }
 
-// 主函数
+    static BT::PortsList providedPorts() {
+        return {
+            BT::InputPort<double>("target_x"),
+            BT::InputPort<double>("target_y")
+        };
+    }
+
+    NodeStatus tick() override
+    {
+        if (!blackboard_->get<turtlesim::msg::Pose>("current_pose", current_pose_)) {}
+        double distance = std::hypot(current_pose_.x - target_x_, current_pose_.y - target_y_);
+        if (distance < DISTANCE_TOLERANCE)
+        {
+            return NodeStatus::SUCCESS; // 达到目标
+        }
+        if (child_node_->executeTick() == NodeStatus::SUCCESS) {
+            return NodeStatus::RUNNING;
+        }
+        return NodeStatus::FAILURE;
+    }
+
+private:
+    turtlesim::msg::Pose current_pose_;
+    BT::Blackboard::Ptr blackboard_;
+    double target_x_, target_y_;
+};
+
+static const char* xml_text = R"(
+      <root BTCPP_format="4">
+        <BehaviorTree>
+          <StopOnceAchieved target_x="0.0" target_y="0.0" >
+              <Sequence>
+                <TurtlePoseSubscriber topic_name="turtle1/pose" />
+                <TurtleTwistPublisher topic_name="turtle1/cmd_vel" speed="2.0" />
+              </Sequence>
+            </StopOnceAchieved>
+        </BehaviorTree>
+      </root>
+    )";
+
+// 主程序
 int main(int argc, char** argv)
 {
     rclcpp::init(argc, argv);
     auto nh = std::make_shared<rclcpp::Node>("turtle_control_node");
 
-    BehaviorTreeFactory factory;
-    RosNodeParams params;
+    BT::BehaviorTreeFactory factory;
+    BT::RosNodeParams params;
     params.nh = nh;
 
     factory.registerNodeType<TurtlePoseSubscriber>("TurtlePoseSubscriber", params);
     factory.registerNodeType<TurtleTwistPublisher>("TurtleTwistPublisher", params);
+    factory.registerNodeType<StopOnceAchieved>("StopOnceAchieved", params);
+
     auto tree = factory.createTreeFromText(xml_text);
 
-    while (rclcpp::ok())
-    {
-        tree.tickWhileRunning(); // 执行行为树
-        rclcpp::spin_some(nh); // 不断处理 ROS 消息
+    while (rclcpp::ok()) {
+        if (tree.tickWhileRunning() == NodeStatus::SUCCESS) {
+            break;
+        }
     }
 
     rclcpp::shutdown();

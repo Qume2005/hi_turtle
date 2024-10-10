@@ -19,7 +19,7 @@ public:
             }
             throw std::runtime_error("Parameter retrieval failed");
         }
-        blackboard_ = BT::Blackboard::create(config.blackboard);
+        blackboard_ = config.blackboard;
     }
 
     static PortsList providedPorts()
@@ -65,7 +65,7 @@ public:
         RCLCPP_INFO(node_->get_logger(), "Topic Name: %s", topic_name_.c_str());
         RCLCPP_INFO(node_->get_logger(), "Target Position: (%f, %f)", target_x_, target_y_);
         RCLCPP_INFO(node_->get_logger(), "Speed: %f", speed_);
-        blackboard_ = BT::Blackboard::create(config.blackboard);
+        blackboard_ = config.blackboard;
     }
 
     static BT::PortsList providedPorts() {

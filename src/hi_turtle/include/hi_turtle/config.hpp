@@ -1,0 +1,4 @@
+#pragma once
+
+#define DISTANCE_TOLERANCE 0.1
+#define ANGULAR_TOLERANCE 0.01
